@@ -17,10 +17,7 @@ type ViewerCallbacks = {
 const DOT_PIXELS = 34;
 const CAMERA_FOV = 34;
 const DEPTH_PREPASS = "depth-prepass";
-const PLINTH_Y = -2.5;
-const PLINTH_TOP = PLINTH_Y + 0.17;
-/** Slightly above eye level, so the plinth reads as a disc the organ sits on
- *  rather than an edge-on band across the background. */
+const CONTACT_SHADOW_Y = -2.32;
 const HOME_CAMERA = { x: 0, y: 1.05, z: 8.2 };
 const HOME_TARGET = { x: 0, y: 0.02, z: 0 };
 
@@ -34,7 +31,6 @@ export class AnatomyViewer {
   private callbacks: ViewerCallbacks;
   private container: HTMLElement;
   private organ: LoadedOrgan | null = null;
-  private plinth!: THREE.Mesh;
   private contactShadow!: THREE.Mesh;
 
   private frame = 0;
@@ -169,13 +165,6 @@ export class AnatomyViewer {
 
     this.scene.environment = this.buildEnvironmentMap();
 
-    this.plinth = new THREE.Mesh(
-      new THREE.CylinderGeometry(2.3, 2.48, 0.34, 56),
-      new THREE.MeshStandardMaterial({ color: 0xead7c1, roughness: 0.78, metalness: 0 }),
-    );
-    this.plinth.position.y = PLINTH_Y;
-    this.scene.add(this.plinth);
-
     this.contactShadow = new THREE.Mesh(
       new THREE.PlaneGeometry(4.2, 4.2),
       new THREE.MeshBasicMaterial({
@@ -187,7 +176,7 @@ export class AnatomyViewer {
       }),
     );
     this.contactShadow.rotation.x = -Math.PI / 2;
-    this.contactShadow.position.y = PLINTH_TOP + 0.005;
+    this.contactShadow.position.y = CONTACT_SHADOW_Y;
     this.contactShadow.renderOrder = 1;
     this.scene.add(this.contactShadow);
 
@@ -617,9 +606,6 @@ export class AnatomyViewer {
 
   toggleIsolate() {
     this.isolated = !this.isolated;
-    const plinth = this.plinth.material as THREE.MeshStandardMaterial;
-    plinth.transparent = true;
-    this.tween(plinth, { opacity: this.isolated ? 0.15 : 1, duration: 0.45 });
     this.tween(this.contactShadow.material, { opacity: this.isolated ? 0.08 : 0.55, duration: 0.45 });
     return this.isolated;
   }
