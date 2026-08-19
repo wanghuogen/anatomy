@@ -159,6 +159,7 @@ export class AnatomyAssetManager {
     organ.pivot.rotation.set(0.05, -0.28, 0);
     organ.pivot.position.set(0, 0, 0);
     organ.meshes.forEach((mesh) => {
+      mesh.visible = true;
       this.forEachMaterial(mesh, (material) => {
         material.transparent = false;
         material.opacity = 1;

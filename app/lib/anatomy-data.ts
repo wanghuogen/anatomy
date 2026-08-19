@@ -22,6 +22,26 @@ export type HotspotStructure = {
   color: string;
 };
 
+export type InternalStructureGroup = "chambers" | "valves" | "papillary";
+
+export type InternalStructure = {
+  id: string;
+  nodeName: string;
+  ontologyId: string;
+  group: InternalStructureGroup;
+  label: { zh: string; en: string };
+};
+
+export type InternalOrganView = {
+  model: string;
+  sourceName: string;
+  sourceVersion: string;
+  sourceUrl: string;
+  license: string;
+  licenseUrl: string;
+  structures: InternalStructure[];
+};
+
 export type OrganStructure = {
   id: OrganId;
   model: string;
@@ -32,6 +52,7 @@ export type OrganStructure = {
   /** Latin binomial — intentionally identical in every locale. */
   scientificName: string;
   hotspots: HotspotStructure[];
+  internalView?: InternalOrganView;
 };
 
 export const organStructures: OrganStructure[] = [
@@ -50,6 +71,30 @@ export const organStructures: OrganStructure[] = [
       { id: "right-ventricle", ta: "Ventriculus dexter", position: [-0.65, -0.68, 0.66], color: "#ee7c6a" },
       { id: "mitral", ta: "Valva atrioventricularis sinistra", position: [0.18, -1.35, 0.48], color: "#d89bc4" },
     ],
+    internalView: {
+      model: "/models/heart-internal-hra-v1.3.glb",
+      sourceName: "Human Reference Atlas",
+      sourceVersion: "heart-male v1.3",
+      sourceUrl: "https://purl.humanatlas.io/ref-organ/heart-male/v1.3",
+      license: "CC BY 4.0",
+      licenseUrl: "https://creativecommons.org/licenses/by/4.0/",
+      structures: [
+        { id: "left-atrium", nodeName: "VH_M_left_cardiac_atrium", ontologyId: "UBERON:0002079", group: "chambers", label: { zh: "左心房", en: "Left atrium" } },
+        { id: "right-atrium", nodeName: "VH_M_right_cardiac_atrium", ontologyId: "UBERON:0002078", group: "chambers", label: { zh: "右心房", en: "Right atrium" } },
+        { id: "right-ventricle", nodeName: "VH_M_heart_right_ventricle", ontologyId: "UBERON:0002080", group: "chambers", label: { zh: "右心室", en: "Right ventricle" } },
+        { id: "septum", nodeName: "VH_M_interventricular_septum", ontologyId: "UBERON:0002094", group: "chambers", label: { zh: "室间隔", en: "Interventricular septum" } },
+        { id: "left-ventricle", nodeName: "VH_M_heart_left_ventricle", ontologyId: "UBERON:0002084", group: "chambers", label: { zh: "左心室", en: "Left ventricle" } },
+        { id: "mitral-valve", nodeName: "VH_M_mitral_valve", ontologyId: "UBERON:0002135", group: "valves", label: { zh: "二尖瓣", en: "Mitral valve" } },
+        { id: "tricuspid-valve", nodeName: "VH_M_tricuspid_valve", ontologyId: "UBERON:0002134", group: "valves", label: { zh: "三尖瓣", en: "Tricuspid valve" } },
+        { id: "aortic-valve", nodeName: "VH_M_aortic_valve", ontologyId: "UBERON:0002137", group: "valves", label: { zh: "主动脉瓣", en: "Aortic valve" } },
+        { id: "pulmonary-valve", nodeName: "VH_M_pulmonary_valve", ontologyId: "UBERON:0002146", group: "valves", label: { zh: "肺动脉瓣", en: "Pulmonary valve" } },
+        { id: "papillary-anterior", nodeName: "VH_M_papillary_muscle_of_heart_anterior", ontologyId: "FMA:7264", group: "papillary", label: { zh: "左心室前乳头肌", en: "Anterior papillary muscle" } },
+        { id: "papillary-anterolateral", nodeName: "VH_M_papillary_muscle_of_heart_anterolateral", ontologyId: "FMA:7265", group: "papillary", label: { zh: "左心室前外侧乳头肌", en: "Anterolateral papillary muscle" } },
+        { id: "papillary-medial", nodeName: "VH_M_papillary_muscle_of_heart_medial", ontologyId: "FMA:7262", group: "papillary", label: { zh: "右心室间隔乳头肌", en: "Septal papillary muscle" } },
+        { id: "papillary-posterior", nodeName: "VH_M_papillary_muscle_of_heart_posterior", ontologyId: "FMA:7261", group: "papillary", label: { zh: "右心室后乳头肌", en: "Posterior papillary muscle" } },
+        { id: "papillary-posteromedial", nodeName: "VH_M_papillary_muscle_of_heart_posteromedial", ontologyId: "FMA:7267", group: "papillary", label: { zh: "左心室后内侧乳头肌", en: "Posteromedial papillary muscle" } },
+      ],
+    },
   },
   {
     id: "brain",

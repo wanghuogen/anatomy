@@ -14,6 +14,28 @@ type ViewerCallbacks = {
   onAuthorPoint?: (point: { x: number; y: number; z: number }) => void;
 };
 
+type ClinicalHeartState = "normal" | "disease" | "postop";
+
+type ClinicalFlow = {
+  points: THREE.Points;
+  positions: Float32Array;
+  count: number;
+  reverse: boolean;
+};
+
+type ClinicalValveAnimation = {
+  mesh: THREE.Mesh;
+  originalGeometry: THREE.BufferGeometry;
+  animatedGeometry: THREE.BufferGeometry;
+  originalPositions: Float32Array;
+  center: THREE.Vector3;
+  flowDirection: THREE.Vector3;
+  splitAxis: THREE.Vector3;
+  maxSplit: number;
+  amplitude: number;
+  openness: number;
+};
+
 const DOT_PIXELS = 34;
 const CAMERA_FOV = 34;
 const DEPTH_PREPASS = "depth-prepass";
@@ -42,6 +64,7 @@ export class AnatomyViewer {
   private depthMaterial = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: true, depthTest: true });
   private crossSection = false;
   private isolated = false;
+  private zoomed = false;
 
   private width = 1;
   private height = 1;
@@ -69,6 +92,15 @@ export class AnatomyViewer {
   private quizMode = false;
   private authoring = false;
   private authorRaycaster = new THREE.Raycaster();
+  private clinicalRequest: { state: ClinicalHeartState; playing: boolean; phase: "filling" | "pumping" } | null = null;
+  private clinicalValve: ClinicalValveAnimation | null = null;
+  private clinicalForwardFlow: ClinicalFlow | null = null;
+  private clinicalRefluxFlow: ClinicalFlow | null = null;
+  private clinicalFlowCenter = new THREE.Vector3();
+  private clinicalFlowDirection = new THREE.Vector3(0, -1, 0);
+  private clinicalFlowSide = new THREE.Vector3(1, 0, 0);
+  private clinicalFlowUp = new THREE.Vector3(0, 0, 1);
+  private clinicalTime = 0;
 
   constructor(container: HTMLElement, callbacks: ViewerCallbacks) {
     this.container = container;
@@ -240,6 +272,7 @@ export class AnatomyViewer {
 
     const outgoing = this.organ;
     if (outgoing) {
+      this.clearClinicalHeartAnimation();
       // Switching mid-fade would otherwise leave the tween running and the
       // depth proxies attached to a released organ.
       this.fadeTween?.kill();
@@ -297,6 +330,7 @@ export class AnatomyViewer {
       .to(organ.pivot.scale, { x: 1, y: 1, z: 1, duration: 0.9, ease: "back.out(1.25)" }, 0)
       .to(organ.pivot.position, { z: 0, duration: 0.85, ease: "power3.out" }, 0)
       .to(this.camera.position, { z: 8.2, duration: 0.9, ease: "power2.out" }, 0.08);
+    if (this.clinicalRequest) this.setupClinicalHeartAnimation();
   }
 
   private materials(organ: LoadedOrgan) {
@@ -320,7 +354,7 @@ export class AnatomyViewer {
     const state = { value: to >= 1 ? 0 : 1 };
     materials.forEach((material) => {
       material.transparent = true;
-      material.opacity = state.value;
+      material.opacity = state.value * ((material.userData.anatomyOpacity as number | undefined) ?? 1);
       material.depthWrite = true;
     });
     this.setDepthPrepass(organ, true);
@@ -330,15 +364,17 @@ export class AnatomyViewer {
       duration,
       ease: "power2.out",
       onUpdate: () => {
-        materials.forEach((material) => (material.opacity = state.value));
+        materials.forEach((material) => (material.opacity = state.value * ((material.userData.anatomyOpacity as number | undefined) ?? 1)));
         this.dirty = true;
       },
       onComplete: () => {
         if (to >= 1) {
           materials.forEach((material) => {
-            material.transparent = false;
-            material.opacity = 1;
-            material.depthWrite = true;
+            const opacity = (material.userData.anatomyOpacity as number | undefined) ?? 1;
+            material.transparent = opacity < 0.999;
+            material.opacity = opacity;
+            material.depthWrite = opacity >= 0.999;
+            material.side = opacity < 0.999 ? THREE.DoubleSide : THREE.FrontSide;
           });
         }
         this.setDepthPrepass(organ, false);
@@ -385,6 +421,7 @@ export class AnatomyViewer {
       this.assets.update(delta);
       this.dirty = true;
     }
+    if (this.clinicalRequest && this.clinicalValve) this.updateClinicalHeartAnimation(delta);
     if (this.hoverProbe) this.resolveHover();
     if (!this.dirty && now >= this.busyUntil) return;
 
@@ -591,6 +628,17 @@ export class AnatomyViewer {
 
   reset() {
     this.select(null);
+    this.zoomed = false;
+    this.isolated = false;
+    this.crossSection = false;
+    this.clipPlane.constant = -1.8;
+    this.applyClipping(false);
+    this.tween(this.contactShadow.material, { opacity: 0.55, duration: 0.45 });
+    if (this.organ) {
+      this.materials(this.organ).forEach((material) => {
+        if (material instanceof THREE.MeshStandardMaterial) material.wireframe = false;
+      });
+    }
     this.tween(this.camera.position, { ...HOME_CAMERA, duration: 0.8, ease: "power3.out" });
     this.tween(this.controls.target, { ...HOME_TARGET, duration: 0.8, ease: "power3.out" });
     if (this.organ) this.tween(this.organ.pivot.rotation, { x: 0.05, y: -0.28, z: 0, duration: 0.8, ease: "power3.out" });
@@ -602,6 +650,16 @@ export class AnatomyViewer {
       duration: 0.5,
       ease: "power2.out",
     });
+  }
+
+  toggleZoom() {
+    this.zoomed = !this.zoomed;
+    this.tween(this.camera.position, {
+      z: this.zoomed ? 5.6 : HOME_CAMERA.z,
+      duration: 0.55,
+      ease: "power2.out",
+    });
+    return this.zoomed;
   }
 
   toggleIsolate() {
@@ -650,6 +708,283 @@ export class AnatomyViewer {
     return enabled;
   }
 
+  setStructureVisible(nodeName: string, visible: boolean) {
+    if (!this.organ) return false;
+    const mesh = this.organ.meshes.find((item) => item.name === nodeName);
+    if (!mesh) return false;
+    mesh.visible = visible;
+    this.dirty = true;
+    return true;
+  }
+
+  colorStructures(entries: Array<{ nodeName: string; color: string }>) {
+    if (!this.organ) return;
+    const colors = new Map(entries.map((entry) => [entry.nodeName, entry.color]));
+    this.organ.meshes.forEach((mesh) => {
+      const color = colors.get(mesh.name);
+      if (!color) return;
+      if (!mesh.userData.anatomyPalette) {
+        mesh.material = Array.isArray(mesh.material)
+          ? mesh.material.map((material) => material.clone())
+          : mesh.material.clone();
+        mesh.userData.anatomyPalette = true;
+      }
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      materials.forEach((material) => {
+        if (material instanceof THREE.MeshStandardMaterial) {
+          material.color.set(color);
+          material.roughness = 0.58;
+          material.transparent = false;
+          material.opacity = 1;
+          material.depthWrite = true;
+          material.needsUpdate = true;
+        }
+      });
+    });
+    this.dirty = true;
+  }
+
+  setStructureOpacity(nodeName: string, opacity: number) {
+    if (!this.organ) return;
+    const mesh = this.organ.meshes.find((item) => item.name === nodeName);
+    if (!mesh) return;
+    if (!mesh.userData.anatomyOpacityMaterial) {
+      mesh.material = Array.isArray(mesh.material)
+        ? mesh.material.map((material) => material.clone())
+        : mesh.material.clone();
+      mesh.userData.anatomyOpacityMaterial = true;
+    }
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    materials.forEach((material) => {
+      material.userData.anatomyOpacity = opacity;
+      material.opacity = opacity;
+      material.transparent = opacity < 0.999;
+      material.depthWrite = opacity >= 0.999;
+      material.side = opacity < 0.999 ? THREE.DoubleSide : THREE.FrontSide;
+      material.needsUpdate = true;
+    });
+    this.dirty = true;
+  }
+
+  setStructuresVisible(nodeNames: string[], visible: boolean) {
+    if (!this.organ) return;
+    const names = new Set(nodeNames);
+    this.organ.meshes.forEach((mesh) => {
+      if (names.has(mesh.name)) mesh.visible = visible;
+    });
+    this.dirty = true;
+  }
+
+  isolateStructure(nodeName: string) {
+    if (!this.organ) return;
+    this.organ.meshes.forEach((mesh) => (mesh.visible = mesh.name === nodeName));
+    this.dirty = true;
+  }
+
+  showAllStructures() {
+    if (!this.organ) return;
+    this.organ.meshes.forEach((mesh) => (mesh.visible = true));
+    this.dirty = true;
+  }
+
+  /**
+   * Drives the perioperative teaching scene with the actual HRA valve mesh.
+   * The source model has no rig or morph targets, so the leaflets are deformed
+   * directly from their original vertices. Flow follows the measured line from
+   * the left atrium through the mitral valve toward the left ventricle.
+   */
+  setClinicalHeartAnimation(state: ClinicalHeartState, playing: boolean, phase: "filling" | "pumping") {
+    this.clinicalRequest = { state, playing, phase };
+    if (this.organ && !this.clinicalValve) this.setupClinicalHeartAnimation();
+    if (this.clinicalValve) {
+      this.colorStructures([{
+        nodeName: "VH_M_mitral_valve",
+        color: state === "disease" ? "#d7443e" : state === "postop" ? "#45a56a" : "#d7a34c",
+      }]);
+      this.updateClinicalHeartAnimation(0);
+    }
+    this.busy(0.25);
+  }
+
+  private setupClinicalHeartAnimation() {
+    if (!this.organ || this.clinicalValve) return;
+    const pivot = this.organ.pivot;
+    const mitral = this.organ.meshes.find((mesh) => mesh.name === "VH_M_mitral_valve");
+    const atrium = this.organ.meshes.find((mesh) => mesh.name === "VH_M_left_cardiac_atrium");
+    const ventricle = this.organ.meshes.find((mesh) => mesh.name === "VH_M_heart_left_ventricle");
+    if (!mitral || !atrium || !ventricle) return;
+
+    pivot.updateWorldMatrix(true, true);
+    const centerInPivot = (object: THREE.Object3D) => {
+      const world = new THREE.Box3().setFromObject(object).getCenter(new THREE.Vector3());
+      return pivot.worldToLocal(world);
+    };
+    const atriumCenter = centerInPivot(atrium);
+    const ventricleCenter = centerInPivot(ventricle);
+    this.clinicalFlowCenter.copy(centerInPivot(mitral));
+    this.clinicalFlowDirection.copy(ventricleCenter).sub(atriumCenter).normalize();
+    const helper = Math.abs(this.clinicalFlowDirection.y) < 0.86 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+    this.clinicalFlowSide.copy(this.clinicalFlowDirection).cross(helper).normalize();
+    this.clinicalFlowUp.copy(this.clinicalFlowSide).cross(this.clinicalFlowDirection).normalize();
+
+    const originalGeometry = mitral.geometry;
+    const animatedGeometry = originalGeometry.clone();
+    const position = animatedGeometry.getAttribute("position") as THREE.BufferAttribute;
+    const originalPositions = new Float32Array(position.array as ArrayLike<number>);
+    animatedGeometry.computeBoundingBox();
+    const box = animatedGeometry.boundingBox!;
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+
+    const worldOrigin = pivot.localToWorld(this.clinicalFlowCenter.clone());
+    const worldAlongFlow = pivot.localToWorld(this.clinicalFlowCenter.clone().add(this.clinicalFlowDirection));
+    const localOrigin = mitral.worldToLocal(worldOrigin.clone());
+    const localFlow = mitral.worldToLocal(worldAlongFlow.clone()).sub(localOrigin).normalize();
+    const axes = [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1)];
+    const dimensions = [size.x, size.y, size.z];
+    let splitAxis = axes[0];
+    let bestScore = -Infinity;
+    axes.forEach((axis, index) => {
+      const score = dimensions[index] * (1 - Math.abs(axis.dot(localFlow)));
+      if (score > bestScore) { bestScore = score; splitAxis = axis; }
+    });
+    let maxSplit = 0;
+    for (let i = 0; i < originalPositions.length; i += 3) {
+      const projection = (originalPositions[i] - center.x) * splitAxis.x
+        + (originalPositions[i + 1] - center.y) * splitAxis.y
+        + (originalPositions[i + 2] - center.z) * splitAxis.z;
+      maxSplit = Math.max(maxSplit, Math.abs(projection));
+    }
+    mitral.geometry = animatedGeometry;
+    this.clinicalValve = {
+      mesh: mitral,
+      originalGeometry,
+      animatedGeometry,
+      originalPositions,
+      center,
+      flowDirection: localFlow,
+      splitAxis: splitAxis.clone(),
+      maxSplit: Math.max(maxSplit, 0.001),
+      amplitude: Math.max(size.x, size.y, size.z) * 0.16,
+      openness: this.clinicalRequest?.phase === "filling" ? 1 : 0,
+    };
+
+    this.clinicalForwardFlow = this.createClinicalFlow(48, 0xff4938, false);
+    this.clinicalRefluxFlow = this.createClinicalFlow(38, 0x10cfff, true);
+    pivot.add(this.clinicalForwardFlow.points, this.clinicalRefluxFlow.points);
+    this.updateClinicalHeartAnimation(0);
+  }
+
+  private createClinicalFlow(count: number, color: number, reverse: boolean): ClinicalFlow {
+    const positions = new Float32Array(count * 3);
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    const material = new THREE.PointsMaterial({
+      color,
+      size: reverse ? 0.115 : 0.092,
+      transparent: true,
+      opacity: 1,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+      sizeAttenuation: true,
+      toneMapped: false,
+    });
+    const points = new THREE.Points(geometry, material);
+    points.name = reverse ? "clinical-mitral-reflux" : "clinical-mitral-forward-flow";
+    points.frustumCulled = false;
+    points.renderOrder = 8;
+    return { points, positions, count, reverse };
+  }
+
+  private updateClinicalHeartAnimation(delta: number) {
+    const request = this.clinicalRequest;
+    const valve = this.clinicalValve;
+    if (!request || !valve) return;
+    if (request.playing) this.clinicalTime += delta;
+
+    const targetOpen = request.phase === "filling" ? 1 : 0;
+    valve.openness = delta > 0 ? THREE.MathUtils.damp(valve.openness, targetOpen, 8, delta) : targetOpen;
+    const position = valve.animatedGeometry.getAttribute("position") as THREE.BufferAttribute;
+    const target = position.array as Float32Array;
+    const diseaseGap = request.state === "disease" && request.phase === "pumping" ? 1 : 0;
+    for (let i = 0; i < target.length; i += 3) {
+      const x = valve.originalPositions[i];
+      const y = valve.originalPositions[i + 1];
+      const z = valve.originalPositions[i + 2];
+      const projection = (x - valve.center.x) * valve.splitAxis.x
+        + (y - valve.center.y) * valve.splitAxis.y
+        + (z - valve.center.z) * valve.splitAxis.z;
+      const centreWeight = Math.pow(1 - Math.min(Math.abs(projection) / valve.maxSplit, 1), 2);
+      const side = projection < 0 ? -1 : 1;
+      const spread = valve.amplitude * centreWeight * (valve.openness * 0.95 + diseaseGap * 0.32) * side;
+      const bend = valve.amplitude * centreWeight * (valve.openness * 0.28 - (diseaseGap && side > 0 ? 0.52 : 0));
+      target[i] = x + valve.splitAxis.x * spread + valve.flowDirection.x * bend;
+      target[i + 1] = y + valve.splitAxis.y * spread + valve.flowDirection.y * bend;
+      target[i + 2] = z + valve.splitAxis.z * spread + valve.flowDirection.z * bend;
+    }
+    position.needsUpdate = true;
+    valve.animatedGeometry.computeVertexNormals();
+    valve.animatedGeometry.computeBoundingSphere();
+
+    const forwardActive = request.phase === "filling";
+    const refluxActive = request.phase === "pumping" && request.state !== "normal";
+    if (this.clinicalForwardFlow) {
+      this.clinicalForwardFlow.points.visible = forwardActive;
+      this.updateClinicalFlow(this.clinicalForwardFlow, request.state === "postop" ? 0.82 : 1);
+    }
+    if (this.clinicalRefluxFlow) {
+      this.clinicalRefluxFlow.points.visible = refluxActive;
+      const material = this.clinicalRefluxFlow.points.material as THREE.PointsMaterial;
+      material.opacity = request.state === "postop" ? 0.3 : 1;
+      material.size = request.state === "postop" ? 0.055 : 0.115;
+      this.updateClinicalFlow(this.clinicalRefluxFlow, request.state === "postop" ? 0.48 : 1);
+    }
+    if (request.playing || delta === 0) this.dirty = true;
+  }
+
+  private updateClinicalFlow(flow: ClinicalFlow, strength: number) {
+    const direction = flow.reverse ? this.clinicalFlowDirection.clone().multiplyScalar(-1) : this.clinicalFlowDirection;
+    const span = (flow.reverse ? 1.35 : 1.08) * strength;
+    const speed = flow.reverse ? 0.48 : 0.62;
+    for (let i = 0; i < flow.count; i += 1) {
+      const seed = (i * 0.61803398875) % 1;
+      const progress = (seed + this.clinicalTime * speed) % 1;
+      const angle = i * 2.3999632297;
+      const radius = (0.025 + 0.085 * Math.sin(Math.PI * progress)) * strength;
+      const axial = (progress - 0.5) * span;
+      const offset = i * 3;
+      flow.positions[offset] = this.clinicalFlowCenter.x + direction.x * axial
+        + this.clinicalFlowSide.x * Math.cos(angle) * radius + this.clinicalFlowUp.x * Math.sin(angle) * radius;
+      flow.positions[offset + 1] = this.clinicalFlowCenter.y + direction.y * axial
+        + this.clinicalFlowSide.y * Math.cos(angle) * radius + this.clinicalFlowUp.y * Math.sin(angle) * radius;
+      flow.positions[offset + 2] = this.clinicalFlowCenter.z + direction.z * axial
+        + this.clinicalFlowSide.z * Math.cos(angle) * radius + this.clinicalFlowUp.z * Math.sin(angle) * radius;
+    }
+    (flow.points.geometry.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
+  }
+
+  private clearClinicalHeartAnimation() {
+    if (this.clinicalValve) {
+      this.clinicalValve.mesh.geometry = this.clinicalValve.originalGeometry;
+      this.clinicalValve.animatedGeometry.dispose();
+      this.clinicalValve = null;
+    }
+    [this.clinicalForwardFlow, this.clinicalRefluxFlow].forEach((flow) => {
+      if (!flow) return;
+      flow.points.removeFromParent();
+      flow.points.geometry.dispose();
+      (flow.points.material as THREE.Material).dispose();
+    });
+    this.clinicalForwardFlow = null;
+    this.clinicalRefluxFlow = null;
+  }
+
+  setPresentation(distance: number, offsetX = 0) {
+    this.tween(this.camera.position, { z: distance, duration: 0.55, ease: "power2.out" });
+    if (this.organ) this.tween(this.organ.pivot.position, { x: offsetX, duration: 0.55, ease: "power2.out" });
+  }
+
   dispose() {
     this.disposed = true;
     this.loadRequest += 1;
@@ -668,6 +1003,7 @@ export class AnatomyViewer {
     canvas.removeEventListener("pointerleave", this.onPointerLeave);
     canvas.removeEventListener("keydown", this.onKeyDown);
 
+    this.clearClinicalHeartAnimation();
     this.hotspots.dispose();
     this.depthMaterial.dispose();
     this.assets.dispose();
