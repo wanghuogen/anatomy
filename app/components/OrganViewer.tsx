@@ -11,12 +11,16 @@ import {
   Search,
   Check,
   Crosshair,
+  Eye,
+  EyeOff,
+  Focus,
   Sparkles,
   X,
 } from "lucide-react";
 import type { Hotspot, Organ } from "../i18n/merge";
 import { format, type UiDictionary } from "../i18n/types";
 import type { AnatomyViewer } from "../lib/three/viewer";
+import type { ClinicalHeartState } from "./ClinicalEducation";
 
 type Props = {
   organ: Organ;
@@ -27,7 +31,16 @@ type Props = {
   onCompare: () => void;
   quizActive: boolean;
   onQuizExit: () => void;
+  onNotice: (message: string) => void;
+  locale: string;
+  clinicalState?: ClinicalHeartState | null;
 };
+
+const STRUCTURE_COLORS = {
+  chambers: "#cf7775",
+  valves: "#d7a34c",
+  papillary: "#8f6b91",
+} as const;
 
 /** Fisher–Yates. The quiz asks for every structure once, in a fresh order. */
 function shuffle<T>(items: T[]): T[] {
@@ -162,7 +175,7 @@ function useAuthoringFlag() {
   );
 }
 
-export function OrganViewer({ organ, t, autoRotate, onAutoRotate, compare, onCompare, quizActive, onQuizExit }: Props) {
+export function OrganViewer({ organ, t, autoRotate, onAutoRotate, compare, onCompare, quizActive, onQuizExit, onNotice, locale, clinicalState }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<AnatomyViewer | null>(null);
   const organRef = useRef(organ);
@@ -172,7 +185,18 @@ export function OrganViewer({ organ, t, autoRotate, onAutoRotate, compare, onCom
   const [loading, setLoading] = useState(true);
   const [progress, setProgress] = useState(0);
   const [slowLoad, setSlowLoad] = useState(false);
-  const [activeTool, setActiveTool] = useState<string | null>(null);
+  const [activeTools, setActiveTools] = useState<string[]>([]);
+  const [viewChoice, setViewChoice] = useState<{ organId: string; mode: "external" | "internal" }>({ organId: organ.id, mode: "external" });
+  const [structureVisibility, setStructureVisibility] = useState<Record<string, boolean>>({});
+  const internalView = organ.internalView;
+  const internalMode = Boolean(internalView && (clinicalState || (viewChoice.organId === organ.id && viewChoice.mode === "internal")) && !quizActive);
+  const copy = locale === "zh" ? {
+    external: "外部结构", internal: "内部结构", panel: "心脏内部", cutaway: "透明剖面", showAll: "完整显示",
+    chambers: "心腔与间隔", valves: "心脏瓣膜", papillary: "乳头肌", isolate: "单独显示", source: "模型来源",
+  } : {
+    external: "External", internal: "Internal", panel: "Inside the heart", cutaway: "Teaching cutaway", showAll: "Show all",
+    chambers: "Chambers & septum", valves: "Heart valves", papillary: "Papillary muscles", isolate: "Isolate", source: "Model source",
+  };
 
   // Opt-in coordinate probe for placing hotspots — not a user-facing feature.
   const authoring = useAuthoringFlag();
@@ -247,11 +271,38 @@ export function OrganViewer({ organ, t, autoRotate, onAutoRotate, compare, onCom
   }, []);
 
   useEffect(() => {
-    viewerRef.current?.setOrgan(organ.model, organ.hotspots, organ.accent).catch(() => {
+    const internal = internalMode ? internalView : undefined;
+    const model = internal?.model ?? organ.model;
+    const hotspots = internal ? [] : organ.hotspots;
+    viewerRef.current?.setOrgan(model, hotspots, organ.accent).then(() => {
+      setActiveTools([]);
+      if (!internal) {
+        viewerRef.current?.setPresentation(8.2, 0);
+        return;
+      }
+      const visibility = Object.fromEntries(internal.structures.map((structure) => [structure.id, true]));
+      viewerRef.current?.colorStructures(internal.structures.map((structure) => ({
+        nodeName: structure.nodeName,
+        color: structure.id === "septum" ? "#e4c5a4" : STRUCTURE_COLORS[structure.group],
+      })));
+      internal.structures.forEach((structure) => {
+        viewerRef.current?.setStructureVisible(structure.nodeName, true);
+        viewerRef.current?.setStructureOpacity(structure.nodeName, structure.group === "chambers" ? (structure.id === "septum" ? 0.62 : 0.16) : 1);
+      });
+      if (clinicalState) {
+        const mitral = internal.structures.find((structure) => structure.id === "mitral-valve");
+        if (mitral) {
+          viewerRef.current?.colorStructures([{ nodeName: mitral.nodeName, color: clinicalState === "disease" ? "#d9534f" : clinicalState === "postop" ? "#47a66c" : "#d7a34c" }]);
+          viewerRef.current?.setStructureOpacity(mitral.nodeName, 1);
+        }
+      }
+      viewerRef.current?.setPresentation(6.2, -0.65);
+      setStructureVisibility(visibility);
+    }).catch(() => {
       setLoading(false);
       setProgress(0);
     });
-  }, [organ]);
+  }, [organ, internalMode, internalView, clinicalState]);
 
   // A spinning specimen makes "click the mitral valve" a game of chance, so the
   // quiz holds the model still and restores the user's setting on exit.
@@ -269,15 +320,48 @@ export function OrganViewer({ organ, t, autoRotate, onAutoRotate, compare, onCom
   const handleTool = (tool: string) => {
     const viewer = viewerRef.current;
     if (!viewer) return;
-    if (tool === "rotate") onAutoRotate(!autoRotate);
-    if (tool === "zoom") viewer.zoom(-1);
-    if (tool === "isolate") setActiveTool(viewer.toggleIsolate() ? tool : null);
-    if (tool === "section") setActiveTool(viewer.toggleCrossSection() ? tool : null);
-    if (tool === "layers") setActiveTool(viewer.toggleLayers() ? tool : null);
-    if (tool === "compare") onCompare();
+    const setTool = (enabled: boolean) => {
+      setActiveTools((current) => enabled
+        ? (current.includes(tool) ? current : [...current, tool])
+        : current.filter((item) => item !== tool));
+    };
+    if (tool === "rotate") {
+      onAutoRotate(!autoRotate);
+      onNotice(t.tools.rotate);
+    }
+    if (tool === "zoom") {
+      setTool(viewer.toggleZoom());
+      onNotice(t.tools.zoom);
+    }
+    if (tool === "isolate") {
+      setTool(viewer.toggleIsolate());
+      onNotice(t.tools.isolate);
+    }
+    if (tool === "section") {
+      setTool(viewer.toggleCrossSection());
+      onNotice(t.tools.section);
+    }
+    if (tool === "layers") {
+      setTool(viewer.toggleLayers());
+      onNotice(t.tools.layers);
+    }
+    if (tool === "compare") {
+      onCompare();
+      onNotice(t.tools.compare);
+    }
     if (tool === "reset") {
       viewer.reset();
-      setActiveTool(null);
+      if (internalMode && internalView) {
+        const visibility = Object.fromEntries(internalView.structures.map((structure) => [structure.id, true]));
+        internalView.structures.forEach((structure) => {
+          viewer.setStructureVisible(structure.nodeName, true);
+          viewer.setStructureOpacity(structure.nodeName, structure.group === "chambers" ? (structure.id === "septum" ? 0.62 : 0.16) : 1);
+        });
+        viewer.setPresentation(6.2, -0.65);
+        setStructureVisibility(visibility);
+      }
+      setActiveTools([]);
+      onNotice(t.tools.reset);
     }
   };
 
@@ -289,21 +373,60 @@ export function OrganViewer({ organ, t, autoRotate, onAutoRotate, compare, onCom
     { id: "layers", label: t.tools.layers, icon: Layers3 },
     { id: "compare", label: t.tools.compare, icon: Box },
     { id: "reset", label: t.tools.reset, icon: RotateCcw },
-  ];
+  ].filter(({ id }) => !internalMode || !["isolate", "section", "layers"].includes(id));
+
+  const setStructures = (ids: string[], visible: boolean) => {
+    if (!internalView) return;
+    const wanted = new Set(ids);
+    viewerRef.current?.setStructuresVisible(
+      internalView.structures.filter((structure) => wanted.has(structure.id)).map((structure) => structure.nodeName),
+      visible,
+    );
+    setStructureVisibility((current) => ({ ...current, ...Object.fromEntries(ids.map((id) => [id, visible])) }));
+  };
+
+  const applyCutaway = () => {
+    if (!internalView) return;
+    const visibility = Object.fromEntries(internalView.structures.map((structure) => [structure.id, true]));
+    internalView.structures.forEach((structure) => {
+      viewerRef.current?.setStructureVisible(structure.nodeName, true);
+      viewerRef.current?.setStructureOpacity(structure.nodeName, structure.group === "chambers" ? (structure.id === "septum" ? 0.62 : 0.16) : 1);
+    });
+    viewerRef.current?.setPresentation(6.2, -0.65);
+    setStructureVisibility(visibility);
+  };
+
+  const showAllInternal = () => {
+    if (!internalView) return;
+    internalView.structures.forEach((structure) => {
+      viewerRef.current?.setStructureVisible(structure.nodeName, true);
+      viewerRef.current?.setStructureOpacity(structure.nodeName, 1);
+    });
+    setStructureVisibility(Object.fromEntries(internalView.structures.map((structure) => [structure.id, true])));
+  };
+
+  const groups = internalView ? Array.from(new Set(internalView.structures.map((structure) => structure.group))) : [];
 
   return (
-    <section className="viewer-shell" aria-label={format(t.viewer.title, { organ: organ.name })}>
+    <section id="organ-viewer" className="viewer-shell" aria-label={format(t.viewer.title, { organ: organ.name })}>
       <div className="viewer-glow" style={{ "--organ-accent": organ.accent } as React.CSSProperties} />
       <div ref={mountRef} className="three-mount" />
+
+      {internalView && !quizActive && (
+        <div className="view-mode-switch" aria-label={copy.panel}>
+          <button type="button" className={!internalMode ? "active" : ""} onClick={() => setViewChoice({ organId: organ.id, mode: "external" })}>{copy.external}</button>
+          <button type="button" className={internalMode ? "active" : ""} onClick={() => setViewChoice({ organId: organ.id, mode: "internal" })}>{copy.internal}</button>
+        </div>
+      )}
 
       <div className="viewer-tools" aria-label={t.tools.label}>
         {tools.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
             type="button"
-            className={`tool-button ${(activeTool === id || (id === "compare" && compare)) ? "active" : ""}`}
+            className={`tool-button ${(activeTools.includes(id) || (id === "rotate" && autoRotate) || (id === "compare" && compare)) ? "active" : ""}`}
             onClick={() => handleTool(id)}
-            aria-pressed={activeTool === id || (id === "compare" && compare)}
+            aria-pressed={activeTools.includes(id) || (id === "rotate" && autoRotate) || (id === "compare" && compare)}
             title={label}
           >
             <Icon size={19} strokeWidth={1.65} />
@@ -312,7 +435,43 @@ export function OrganViewer({ organ, t, autoRotate, onAutoRotate, compare, onCom
         ))}
       </div>
 
-      {!quizActive && (
+      {internalMode && internalView && (
+        <aside className="internal-structures" aria-label={copy.panel}>
+          <header><strong>{copy.panel}</strong><small>{internalView.structures.length}</small></header>
+          <div className="internal-presets">
+            <button type="button" onClick={applyCutaway}>{copy.cutaway}</button>
+            <button type="button" onClick={showAllInternal}>{copy.showAll}</button>
+          </div>
+          <div className="internal-structure-list">
+            {groups.map((group) => {
+              const items = internalView.structures.filter((structure) => structure.group === group);
+              return (
+                <section key={group}>
+                  <h3>{copy[group]}</h3>
+                  {items.map((structure) => {
+                    const visible = structureVisibility[structure.id] !== false;
+                    return (
+                      <div className="internal-structure-row" key={structure.id} style={{ "--structure-color": structure.id === "septum" ? "#e4c5a4" : STRUCTURE_COLORS[structure.group] } as React.CSSProperties}>
+                        <button type="button" className={visible ? "visible" : ""} onClick={() => setStructures([structure.id], !visible)} aria-pressed={visible}>
+                          {visible ? <Eye size={13} /> : <EyeOff size={13} />}
+                          <span><b>{structure.label[locale === "zh" ? "zh" : "en"]}</b><small>{structure.ontologyId}</small></span>
+                        </button>
+                        <button type="button" title={copy.isolate} aria-label={`${copy.isolate}: ${structure.label[locale === "zh" ? "zh" : "en"]}`} onClick={() => {
+                          viewerRef.current?.isolateStructure(structure.nodeName);
+                          setStructureVisibility(Object.fromEntries(internalView.structures.map((item) => [item.id, item.id === structure.id])));
+                        }}><Focus size={13} /></button>
+                      </div>
+                    );
+                  })}
+                </section>
+              );
+            })}
+          </div>
+          <footer><span>{copy.source}</span><a href={internalView.sourceUrl} target="_blank" rel="noreferrer">{internalView.sourceName} · {internalView.sourceVersion}</a><a href={internalView.licenseUrl} target="_blank" rel="noreferrer">{internalView.license}</a></footer>
+        </aside>
+      )}
+
+      {!quizActive && !internalMode && (
       <aside className="tip-note" aria-label={t.viewer.tip}>
         <span><Sparkles size={15} /> {t.viewer.tip}</span>
         <p>{t.viewer.tipDrag}<br />{t.viewer.tipScroll}<br />{t.viewer.tipClick}</p>
